@@ -1,0 +1,109 @@
+No single database has all of that. Attributes split roughly into three tiers:
+
+**Global geometry + basic type**
+- **OpenStreetMap** — the only global source with per-segment attributes. Tags include `surface`, `width`, `lanes`, `incline`, `smoothness`, `maxweight`. Coverage of the last four is sparse and uneven (often <5% of segments). Get it via Geofabrik extracts or Overpass.
+- **Overture Maps** transportation theme — OSM-derived, cleaned, stable IDs, GeoParquet. Easiest for large-scale analysis.
+- **GRIP** (Global Roads Inventory Project) — ~21M km, harmonized into 5 road classes, no physical attributes. Good for modeling/aggregation.
+- **Microsoft and Meta ML-derived roads** — fill gaps in Africa and South Asia; geometry only.
+
+**Derivable**
+- Length: compute from geometry (use an equal-distance projection, not WGS84 degrees).
+- Incline: sample a DEM (Copernicus GLO-30, SRTM, or FABDEM) along centerlines. This is more reliable than the OSM `incline` tag.
+- Width: estimable from high-res imagery, or approximated from `lanes` × assumed lane width.
+
+**Not available globally**
+Pavement material, structural strength, and condition exist only in national road inventories, and mostly for paved networks:
+- US: FHWA **HPMS** (includes IRI, pavement type, thickness) and **LTPP**
+- EU: national agencies; some harmonization via EuroRoadS/INSPIRE
+- Commercial: HERE, TomTom, Esri StreetMap Premium — richer attributes, licensed, still no global strength data
+
+Practical stack: Overture or OSM for the network, DEM-derived grade, HPMS-style national data joined where it exists.
+
+Here's a build order. Steps 1–3 get you real data; 4–6 derive what nobody publishes; 7 joins it.
+
+## 1. Base network geometry
+
+```bash
+wget https://download.geofabrik.de/asia/philippines-latest.osm.pbf
+osmium tags-filter philippines-latest.osm.pbf w/highway -o ph_roads.pbf
+ogr2ogr -f GPKG ph_roads.gpkg ph_roads.pbf lines
+```
+
+Or Overture (cleaner, stable IDs, GeoParquet):
+```bash
+aws s3 cp --no-sign-request --recursive \
+  s3://overturemaps-us-west-2/release/<latest>/theme=transportation/ .
+```
+Then filter by bbox `116.9,4.6,126.6,21.1`. Overture is OSM-derived but pre-cleaned, which saves you a day of work.
+
+Keep `highway`, `surface`, `lanes`, `width`, `smoothness`, `bridge`, `maxspeed`. Expect `surface` populated maybe 25–40% nationally, `width` under 5%.
+
+## 2. DPWH national road inventory
+
+Two access paths, both awkward:
+
+**The GIS app** (`dpwh.gov.ph/dpwh/gis/rbi`) sits behind an Imperva/Incapsula WAF — plain `requests`/`wget` gets a challenge page, not data. Use Playwright with a real browser context, open DevTools → Network, and capture the XHR the map fires when you filter by region. It's a JSON/ArcGIS-style service; once you have the endpoint and cookie, page through it by district engineering office.
+
+**The Atlas HTML tables** are easier and don't need JS. They live at predictable per-province paths like:
+```
+dpwh.gov.ph/dpwh/<YEAR> DPWH ATLAS/Road Data <YEAR>/<province>.htm
+```
+Older years are on `web.archive.org`, which has no WAF — worth scraping the Wayback CDX API for every province across 2014–2023 to get a time series of surface type and length by section.
+
+Fields you get: road name, section ID, LRP-referenced chainage (start/end km), carriageway width, lane count, surface type, and condition rating. This is section-level with a locational referencing system, so it joins on chainage, not geometry — you'll need step 7.
+
+Also pull the **Road Network Definition and Inventory Update Manual** and the **Visual Road Condition Assessment Manual**. They define the exact codes in those tables; without them the condition columns are meaningless.
+
+## 3. Local roads (the other ~85%)
+
+- **DILG** local road network inventories — per-LGU, submitted under the Local Road Management performance system. Coverage is genuinely spotty; file an FOI request at `foi.gov.ph` against DILG for the consolidated LRM database rather than hunting LGU by LGU.
+- **PSA / OpenSTAT** has aggregate road length by class and province — useful only for validating your totals.
+- FOI also works on DPWH for the raw RBIA export. It's a documented government database, so the request is well-formed; expect 15 working days plus an extension.
+
+## 4. Derive incline
+
+Do not trust OSM's `incline` tag. Use NAMRIA's 5m IfSAR DEM — it's the best national elevation product in Southeast Asia and specifically why the Philippines is a good case for this. Request via NAMRIA's data distribution, or fall back to Copernicus GLO-30 (free, 30m, global).
+
+```python
+import rasterio, numpy as np
+from shapely.ops import substring
+
+# densify each segment to ~20m spacing, sample DEM, regress elevation on distance
+def grade(line, dem):
+    pts = [line.interpolate(d) for d in np.arange(0, line.length, 20)]
+    z = [v[0] for v in dem.sample([(p.x, p.y) for p in pts])]
+    return np.gradient(z, 20)  # per-point grade; take max & mean
+```
+Report both mean grade and max sustained grade over 100m — the second is what matters for truck routing and drainage.
+
+## 5. Derive width
+
+Where `width` is missing, `lanes × 3.35m` is a defensible fill: DPWH's minimum carriageway width for new national road construction is 6.70m, i.e. 3.35m per lane. Flag these as estimated. For higher fidelity on specific corridors, segment Sentinel-2 or PlanetScope imagery, or measure off Mapillary where coverage exists.
+
+## 6. Strength proxy
+
+There's no published structural number. Build a proxy from DPWH's own design minimums:
+
+| Surface | Minimum thickness | Condition |
+|---|---|---|
+| PCC | 280 mm | default |
+| PCC | 230 mm | if cumulative ESAL < 7.0×10⁶ |
+| Asphalt | 50 mm | overlay minimum |
+
+Combine with road class (primary/secondary/tertiary), which determines assumed design traffic, and with DPWH's **traffic count** data (ATC/MCC surveys, published as annual reports) to estimate actual ESALs. That gives you a coarse structural capacity band per section. Label it clearly as inferred — it's a design floor, not an as-built measurement. Actual thickness and CBR data sit in project DUPAs and as-built plans, obtainable only per-project via FOI.
+
+## 7. The join
+
+The hard part. DPWH uses chainage along named sections; OSM uses geometry. Approach:
+
+1. Build a linear referencing system from the DPWH section table (road ID + start/end km).
+2. Match DPWH sections to OSM ways by name fuzzy-match plus `ref` tag (N1, N64, etc. — OSM PH tags these reasonably well).
+3. Within a matched road, use `shapely.ops.substring` to cut OSM geometry at DPWH chainage boundaries.
+4. Validate: your cut lengths should agree with DPWH's stated lengths within a few percent. Where they don't, the road has been realigned or the OSM geometry is stale — flag and inspect.
+
+Budget most of your time here. Expect to match maybe 80–90% of national road km cleanly.
+
+## Worth adding while you're at it
+
+- **HazardHunterPH** / PHIVOLCS-Mines and Geosciences Bureau hazard layers — flood, landslide, liquefaction susceptibility per segment. For political or infrastructure-resilience work this is often the more interesting variable than material.
+- **DPWH flood control project records** — currently politically salient, and joinable to your road sections by district engineering office.
